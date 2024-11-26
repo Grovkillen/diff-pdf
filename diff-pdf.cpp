@@ -55,10 +55,85 @@ bool g_grayscale = false;
 // Resolution to use for rasterization, in DPI
 #define DEFAULT_RESOLUTION 300
 long g_resolution = DEFAULT_RESOLUTION;
+// Global variables for custom colors
+struct Color {
+    unsigned char r, g, b;
+};
+
+// Initialize default colors
+Color added_color = {0, 255, 255}; 			// Default: Cyan
+Color removed_color = {255, 0, 0}; 			// Default: Red
+Color mark_differences_color = {255, 0, 0}; // Default: Red
+
+bool g_apply_blur_to_added = false;
+bool g_apply_blur_to_removed = false;
+double g_blur_factor_added = 1.0;   // Default: 1% of DPI for added areas
+double g_blur_factor_removed = 1.0; // Default: 1% of DPI for removed areas
 
 inline unsigned char to_grayscale(unsigned char r, unsigned char g, unsigned char b)
 {
     return (unsigned char)(0.2126 * r + 0.7152 * g + 0.0722 * b);
+}
+
+bool parse_color(const wxString& color_str, Color& color, const char* flag_name) {
+	wxArrayString components = wxSplit(color_str, ',');
+	if (components.size() == 3) {
+		color.r = wxAtoi(components[0]);
+		color.g = wxAtoi(components[1]);
+		color.b = wxAtoi(components[2]);
+		return true; // Parsing successful
+	} else {
+		// Include the flag name in the error message
+		fprintf(stderr, "Invalid color format for %s: '%s'. Expected format: R,G,B (e.g., 255,0,0).\n",
+				flag_name, color_str.ToStdString().c_str());
+		return false; // Parsing failed
+	}
+}
+
+// Apply a simple box blur to smooth edges
+void apply_blur_to_color(unsigned char *data, int width, int height, int stride, const Color &target_color, double blur_factor) {
+    // Calculate kernel size based on blur factor and DPI
+    const int kernel_size = std::max(1, int(g_resolution * blur_factor / 100.0));
+    const int kernel_radius = kernel_size / 2;
+
+    unsigned char *temp = new unsigned char[height * stride];
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width * 4; x += 4) {
+            unsigned char *pixel = data + y * stride + x;
+            if (*(pixel + 2) == target_color.r && *(pixel + 1) == target_color.g && *(pixel + 0) == target_color.b) {
+                int r_total = 0, g_total = 0, b_total = 0, count = 0;
+
+                for (int ky = -kernel_radius; ky <= kernel_radius; ++ky) {
+                    for (int kx = -kernel_radius; kx <= kernel_radius; ++kx) {
+                        int ny = y + ky;
+                        int nx = x + kx * 4;
+
+                        if (ny >= 0 && ny < height && nx >= 0 && nx < width * 4) {
+                            unsigned char *neighbor_pixel = data + ny * stride + nx;
+                            r_total += *(neighbor_pixel + 2); // Red
+                            g_total += *(neighbor_pixel + 1); // Green
+                            b_total += *(neighbor_pixel + 0); // Blue
+                            count++;
+                        }
+                    }
+                }
+
+                unsigned char *out_pixel = temp + y * stride + x;
+                *(out_pixel + 2) = r_total / count; // Red
+                *(out_pixel + 1) = g_total / count; // Green
+                *(out_pixel + 0) = b_total / count; // Blue
+            } else {
+                unsigned char *out_pixel = temp + y * stride + x;
+                *(out_pixel + 2) = *(pixel + 2);
+                *(out_pixel + 1) = *(pixel + 1);
+                *(out_pixel + 0) = *(pixel + 0);
+            }
+        }
+    }
+
+    memcpy(data, temp, height * stride);
+    delete[] temp;
 }
 
 cairo_surface_t *render_page(PopplerPage *page)
@@ -170,91 +245,97 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
     // and the other two channels from s2:
 
     // first, copy s1 over:
-    if ( s1 )
-    {
-        unsigned char *out = datadiff + r1.y * stridediff + r1.x * 4;
-        for ( int y = 0;
-              y < r1.height;
-              y++, data1 += stride1, out += stridediff )
-        {
-            memcpy(out, data1, r1.width * 4);
-        }
-    }
+	if (s1) {
+		unsigned char *out = datadiff + (r1.y - rdiff.y) * stridediff + (r1.x - rdiff.x) * 4;
+		for (int y = 0; y < r1.height; y++, data1 += stride1, out += stridediff) {
+			memcpy(out, data1, r1.width * 4);
+		}
+	}
 
     // then, copy B channel from s2 over it; also compare the two versions
     // to see if there are any differences:
-    if ( s2 )
-    {
-        unsigned char *out = datadiff + r2.y * stridediff + r2.x * 4;
-        for ( int y = 0;
-              y < r2.height;
-              y++, data2 += stride2, out += stridediff )
-        {
-            bool linediff = false;
+	if (s2) {
+		unsigned char *out = datadiff + (r2.y - rdiff.y) * stridediff + (r2.x - rdiff.x) * 4;
+		for (int y = 0; y < r2.height; y++, data2 += stride2, out += stridediff) {
+			
+			bool linediff = false;
+			
+			for (int x = 0; x < r2.width * 4; x += 4) {
+				// Extract RGB values from both images
+				unsigned char cr1 = *(out + x + 2); // Red from s1
+				unsigned char cg1 = *(out + x + 1); // Green from s1
+				unsigned char cb1 = *(out + x + 0); // Blue from s1
 
-            for ( int x = 0; x < r2.width * 4; x += 4 )
-            {
-                unsigned char cr1 = *(out + x + 0);
-                unsigned char cg1 = *(out + x + 1);
-                unsigned char cb1 = *(out + x + 2);
+				unsigned char cr2 = *(data2 + x + 2); // Red from s2
+				unsigned char cg2 = *(data2 + x + 1); // Green from s2
+				unsigned char cb2 = *(data2 + x + 0); // Blue from s2
 
-                unsigned char cr2 = *(data2 + x + 0);
-                unsigned char cg2 = *(data2 + x + 1);
-                unsigned char cb2 = *(data2 + x + 2);
+				bool diff_r = abs(cr1 - cr2) > g_channel_tolerance;
+				bool diff_g = abs(cg1 - cg2) > g_channel_tolerance;
+				bool diff_b = abs(cb1 - cb2) > g_channel_tolerance;
 
-                if ( cr1 > (cr2+g_channel_tolerance) || cr1 < (cr2-g_channel_tolerance)
-                  || cg1 > (cg2+g_channel_tolerance) || cg1 < (cg2-g_channel_tolerance)
-                  || cb1 > (cb2+g_channel_tolerance) || cb1 < (cb2-g_channel_tolerance)
-                   )
-                {
-                    pixel_diff_count++;
-                    changes = true;
-                    linediff = true;
+				if (diff_r || diff_g || diff_b) {
+					pixel_diff_count++; // Increment the difference counter
+					changes = true;     // Mark that this page has changes
+					linediff = true;    // Mark that this line has differences
 
-                    if ( thumbnail )
-                    {
-                        // calculate the coordinates in the thumbnail
-                        int tx = int((r2.x + x/4.0) * thumbnail_scale);
-                        int ty = int((r2.y + y) * thumbnail_scale);
+					unsigned char r_out, g_out, b_out;
 
-                        // Limit the coordinates to the thumbnail size (may be
-                        // off slightly due to rounding errors).
-                        // See https://github.com/vslavik/diff-pdf/pull/58
-                        tx = std::min(tx, thumbnail_width - 1);
-                        ty = std::min(ty, thumbnail_height - 1);
+					// Determine diff color based on the content of s1 and s2
+					if (cr1 || cg1 || cb1) {
+						// Content exists in the second image but not the first: "Added"
+						r_out = added_color.r;
+						g_out = added_color.g;
+						b_out = added_color.b;
+					} else if (cr2 || cg2 || cb2) {
+						// Content exists in the first image but not the second: "Removed"
+						r_out = removed_color.r;
+						g_out = removed_color.g;
+						b_out = removed_color.b;
+					}
 
-                        // mark changes with red
-                        thumbnail->SetRGB(tx, ty, 255, 0, 0);
-                    }
-                }
+					// Apply the calculated diff color to the current pixel
+					*(out + x + 2) = r_out; // Red
+					*(out + x + 1) = g_out; // Green
+					*(out + x + 0) = b_out; // Blue
 
-                if (g_grayscale)
-                {
-                    // convert both images to grayscale, use blue for s1, red for s2
-                    unsigned char gray1 = to_grayscale(cr1, cg1, cb1);
-                    unsigned char gray2 = to_grayscale(cr2, cg2, cb2);
-                    *(out + x + 0) = gray2;
-                    *(out + x + 1) = (gray1 + gray2) / 2;
-                    *(out + x + 2) = gray1;
-                }
-                else
-                {
-                    // change the B channel to be from s2; RG will be s1
-                    *(out + x + 2) = cb2;
-                }
-            }
+					// Continue with other operations like updating the thumbnail
+					if (thumbnail) {
+						int tx = int((r2.x + x / 4.0) * thumbnail_scale);
+						int ty = int((r2.y + y) * thumbnail_scale);
+						tx = std::min(tx, thumbnail_width - 1);
+						ty = std::min(ty, thumbnail_height - 1);
+						thumbnail->SetRGB(tx, ty, r_out, g_out, b_out);
+					}
+				}
 
-            if (g_mark_differences && linediff)
-            {
-                for (int x = 0; x < (10 < r2.width ? 10 : r2.width) * 4; x+=4)
-                {
-                   *(out + x + 0) = 0;
-                   *(out + x + 1) = 0;
-                   *(out + x + 2) = 255;
-                }
-            }
-        }
-    }
+				if (g_grayscale) {
+					unsigned char gray1 = to_grayscale(cr1, cg1, cb1);
+					unsigned char gray2 = to_grayscale(cr2, cg2, cb2);
+					*(out + x + 0) = gray2;               // Red channel for grayscale
+					*(out + x + 1) = (gray1 + gray2) / 2; // Green channel for grayscale
+					*(out + x + 2) = gray1;               // Blue channel for grayscale
+				}
+			}
+
+			// Highlight differences on the first few pixels of the line
+			if (g_mark_differences && linediff) {
+				for (int x = 0; x < (10 < r2.width ? 10 : r2.width) * 4; x += 4) {
+					*(out + x + 2) = mark_differences_color.r;
+					*(out + x + 1) = mark_differences_color.g;
+					*(out + x + 0) = mark_differences_color.b;
+				}
+			}
+		}
+	}
+
+	// Apply blurring based on user selection
+	if (g_apply_blur_to_added) {
+		apply_blur_to_color(datadiff, rdiff.width, rdiff.height, stridediff, added_color, g_blur_factor_added);
+	}
+	if (g_apply_blur_to_removed) {
+		apply_blur_to_color(datadiff, rdiff.width, rdiff.height, stridediff, removed_color, g_blur_factor_removed);
+	}
 
     // add background image of the page to the thumbnails
     if ( thumbnail )
@@ -917,12 +998,33 @@ int main(int argc, char *argv[])
         { wxCMD_LINE_OPTION,
                   NULL, "dpi", "rasterization resolution (default: " wxSTRINGIZE(DEFAULT_RESOLUTION) " dpi)",
                   wxCMD_LINE_VAL_NUMBER },
+				  
+		{ wxCMD_LINE_OPTION,
+				  NULL, "mark-differences-color", "Color for mark-differences (R,G,B)",
+				  wxCMD_LINE_VAL_STRING },
+				  
+		{ wxCMD_LINE_OPTION,
+				  NULL, "added-color", "Color for added content (R,G,B)",
+				  wxCMD_LINE_VAL_STRING },
+				  
+		{ wxCMD_LINE_OPTION,
+				  NULL, "removed-color", "Color for removed content (R,G,B)",
+				  wxCMD_LINE_VAL_STRING },
+
+		{ wxCMD_LINE_OPTION,
+				  NULL, "apply-blur-to-added", "Apply blur to added areas (percentage of DPI, default: 1.0)",
+				  wxCMD_LINE_VAL_DOUBLE },
+
+		{ wxCMD_LINE_OPTION,
+				  NULL, "apply-blur-to-removed", "Apply blur to removed areas (percentage of DPI, default: 1.0",
+				  wxCMD_LINE_VAL_DOUBLE },
 
         { wxCMD_LINE_SWITCH,
                   NULL, "view", "view the differences in a window" },
 
         { wxCMD_LINE_PARAM,
                   NULL, NULL, "file1.pdf", wxCMD_LINE_VAL_STRING },
+				  
         { wxCMD_LINE_PARAM,
                   NULL, NULL, "file2.pdf", wxCMD_LINE_VAL_STRING },
 
@@ -948,9 +1050,9 @@ int main(int argc, char *argv[])
 
     if ( parser.Found("skip-identical") )
         g_skip_identical = true;
-
-    if ( parser.Found("mark-differences") )
-        g_mark_differences = true;
+	
+	if ( parser.Found("mark-differences") )
+		g_mark_differences = true;
 
     if ( parser.Found("grayscale") )
         g_grayscale = true;
@@ -993,7 +1095,7 @@ int main(int argc, char *argv[])
         if (g_channel_tolerance < 0 || g_channel_tolerance > 255) {
             fprintf(stderr, "Invalid channel-tolerance: %ld. Valid range is 0(default, exact matching)-255\n", g_channel_tolerance);
             return 2;
-	}
+		}
     }
 
 	if ( parser.Found("dpi", &g_resolution) )
@@ -1001,9 +1103,43 @@ int main(int argc, char *argv[])
         if (g_resolution < 1 || g_resolution > 2400) {
             fprintf(stderr, "Invalid dpi: %ld. Valid range is 1-2400 (default: %d)\n", g_resolution, DEFAULT_RESOLUTION);
             return 2;
-	}
+		}
     }
 
+	wxString color_str;
+	if (parser.Found("mark-differences-color", &color_str)) {
+		if (!parse_color(color_str, mark_differences_color, "--mark-differences-color")) {
+			return 2; // Mark failure
+		}
+	}
+	
+	if (parser.Found("added-color", &color_str)) {
+		if (!parse_color(color_str, added_color, "--added-color")) {
+			return 2; // Mark failure
+		}
+	}
+
+	if (parser.Found("removed-color", &color_str)) {
+		if (!parse_color(color_str, removed_color, "--removed-color")) {
+			return 2; // Mark failure
+		}
+	}
+
+	if (parser.Found("apply-blur-to-added", &g_blur_factor_added)) {
+		g_apply_blur_to_added = true;
+		if (g_blur_factor_added <= 0) {
+			fprintf(stderr, "Invalid blur factor for added areas: %.2f. Must be > 0.\n", g_blur_factor_added);
+			return 2;
+		}
+	}
+
+	if (parser.Found("apply-blur-to-removed", &g_blur_factor_removed)) {
+		g_apply_blur_to_removed = true;
+		if (g_blur_factor_removed <= 0) {
+			fprintf(stderr, "Invalid blur factor for removed areas: %.2f. Must be > 0.\n", g_blur_factor_removed);
+			return 2;
+		}
+	}
 
     int retval = 0;
 
